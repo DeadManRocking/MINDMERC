@@ -22,3 +22,23 @@ Deliberately deferred (audit §i can-wait; NOT in this scope, `// TODO (post-dep
 - Added anyway (trivially safe, spec-aligned): Stage 5 wording rule ("never say price/fee/ask — use offer") is now one line in the draft prompt.
 
 Schema: supabase-schema.sql bumped rev 1 → rev 2 — adds `hours_missing_notified` (needed by B3's one-time notice) with an idempotent `alter table ... add column if not exists` so an existing rev-1 table upgrades in place. `post_id unique` for B8 was already present — no other schema change.
+
+---
+
+# CHANGES — spec v3 (Stage 3 stated-budget gate + Watch bucket; Stage 8 public-comment-primary)
+
+Date: 2026-08-14 | Engineer session | Implements the two material spec changes in handoff-v3.md (dated 2026-08-14). No deploy, no external calls — verified locally with `node --check` + secrets scan only.
+
+- **Stage 3 — stated-budget gate + new Watch bucket.** Bucket A now requires a STATED purchase signal: a stated budget, a competing quote, or explicit "hire now" language in the post/comments. A buildable lead WITHOUT that signal is no longer A — it is a new **Watch** bucket: logged separately, never built, never queued. B (needs Cj's PC/paid compute) and C (not buildable) unchanged. Gate exists because build cost is paid on every lead but revenue only on conversions.
+  - `analyzeLead` Gemini prompt rules updated: A = buildable AND stated purchase signal; W = buildable but no stated budget (log only); B/C unchanged; explicit "be conservative" instruction; inferred statements like "$X sounds reasonable" flagged as NOT a purchase signal. (worker.js: analyzeLead prompt)
+  - `normalizeAnalysis` now accepts buckets A/W/B/C (uppercase validation). A requires ds_needed + priority 1–5; W/B require ds_needed but store `priority: null` (spec: priority only meaningful for A, 0/ignored for W/B/C — NULL satisfies the schema's 1–5 check). C returns early as before. (worker.js: normalizeAnalysis)
+  - Ingest: only bucket A rows get `status: 'queued'`; W/B rows are inserted with `status: 'deferred'` and their bucket stored as-is; C discarded (unchanged). The existing `bucket === "A" ? "queued" : "deferred"` ternary already routes W correctly. (worker.js: runIngest insert block)
+- **Schema rev 2 → rev 3** — `bucket` check constraint now allows ('A','W','B','C') via an idempotent migration: `drop constraint if exists leads_bucket_check` + re-add including 'W' (safe to re-run; fresh tables get the updated inline check). Everything else in the schema untouched. (supabase-schema.sql)
+- **Stage 8 — public comment is now the PRIMARY send path; DM is the fallback.**
+  - Approve on the **public-reply** card now returns a tap-to-post link to that post's comment box (the post permalink/URL) and explicitly notes Reddit's mobile app frequently strips URL params, so a true pre-filled reply isn't reliably possible — the copyable text block (printed first, unchanged) is the reliable path. (worker.js: handleTelegramWebhook approve branch)
+  - Approve on the **DM** card is unchanged (copyable text block first + pre-filled compose link using the stored author username) and is now explicitly labelled the fallback path. (worker.js: approve branch, sendApprovalCard label "DM offer (fallback path)")
+  - Approval card labels now say "Public reply (primary path)" / "DM offer (fallback path)". The bot still never calls a Reddit send API — a real human always fires the post/message in Reddit's own UI.
+- **README.md** — pipeline description updated: triage buckets A/W/B/C (A queued, W/B logged-deferred, C discarded) and Stage 8 "public comment primary, DM fallback" wording; schema row bumped to rev 3.
+- **handoff-v3.md** — replaced with the 2026-08-14 spec revision (already the live spec in /home/team/shared/msd).
+
+Deferred (unchanged from rev 2, TODO comments still in place): Reddit OAuth password grant for search, Stage 2 comment fetching, redo-with-feedback.

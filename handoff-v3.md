@@ -3,30 +3,30 @@ This supersedes any earlier version of this doc. Read fully before acting. Use c
 
 ## Live status — update this before you stop, every time
 Overwrite this block after completing any step. A fresh instance in a new session/account reads only this section to know exactly where to pick up — don't make it guess.
-- Last updated: [date/time]
-- Which lifecycle phase is this session: [Phase 1 — building MSD itself / Phase 2 — building one queued Solution]
-- Reddit client ID/secret: [provided by Cj directly this session — not stored in this file]
-- Cloudflare / Supabase / Telegram / Gemini provisioning: [status of each]
-- Worker (MSD) deployed: [yes/no, URL]
-- End-to-end test (search → triage → queue write): [pass/fail, details]
-- Blockers right now: [specific]
+- Last updated: 2026-08-12
+- Which lifecycle phase is this session: [Phase 1 — building MSD itself]
+- Reddit client ID/secret: [pending from Cj — not needed for initial deploy; OAuth wiring is a post-deploy TODO]
+- Cloudflare / Supabase / Telegram / Gemini provisioning: [Cloudflare token + account ID received; Supabase project yglhofcpdnxjkkviwmrj + service key received; Gemini key received; Telegram bot token + chat id received. Owner saving all to Secrets vault (on phone). SUPABASE_ACCESS_TOKEN pending for programmatic schema application.]
+- Worker (MSD) deployed: [no — spec-v3 update in progress, then deploy]
+- End-to-end test (search → triage → queue write): [not yet run]
+- Blockers right now: [secrets not yet all saved to vault; worker being updated to spec v3 (Stage 3 stated-budget gate + Watch bucket; Stage 8 public-comment-primary); repo PR #1 open awaiting spec update + merge]
 
 ## Victory Objective (read first, keep every decision aligned to this)
 The business model, verbatim: **Find need. Build Solution. Fill need with Solution. Reach out and offer the full-but-time-limited version (the demo) for a steal price they can't say no to, having their Solution already in hand. Collect payment. Repeat.**
 Do everything, end to end, such that the person with the need cannot reasonably say anything but an immediate "yes."
 
 ## Terminology — read once, don't get this confused
-**MSD (MINDMERC: Search & Deploy) is a Cloudflare Worker. It is NOT an AI agent and has zero build capacity.** It's lightweight serverless plumbing: it searches, triages, prices, drafts, routes for approval, and sends — via API calls to Reddit, Gemini, Telegram, and Supabase. It cannot write, compile, or host a custom app. Building each Delivered Solution (DS) is a completely separate job, done in separate PxC sessions — see below.
+**MSD (MINDMERC: Search & Deploy) is a Cloudflare Worker. It is NOT an AI agent and has zero build capacity.** It's lightweight serverless plumbing: it searches, triages, prices, drafts, routes for approval, and sends — via API calls to Reddit, Gemini, Telegram, and Supabase. It cannot write, compile, or host a custom app. Building each Delivered Solution (DS) is a completely separate job, done in separate cto.new sessions — see below.
 
 ## Operator context
 - Reddit account: brand new, 0 karma, username **MINDMERC**.
 - Reddit client ID/secret: Cj registers the app and obtains these himself, manually, before Phase 1 starts. He provides them directly in the session — never generate or attempt Reddit app registration yourself.
-- Non-coder. This is exactly why Solution-building lives in its own supervised PxC sessions, not in unattended Worker code.
+- Non-coder. This is exactly why Solution-building lives in its own supervised cto.new sessions, not in unattended Worker code.
 - Budget: $0. Every tool in this stack must be free tier, even if only usable for a few days.
 
 ## Lifecycle — two phases, don't conflate them
-1. **Phase 1 (once)**: A PxC session builds and deploys MSD (the Worker) itself — Cloudflare, Supabase, Telegram bot, Gemini key, Reddit search wired up. Once deployed, MSD runs on its own, permanently, on Cloudflare's cron — no PxC session is needed to keep it running.
-2. **Phase 2 (repeated, one at a time, as needed)**: MSD finds and triages leads on its own and queues Bucket-A ones (see queue below). Separately, whenever there's a queued lead, Cj opens a fresh PxC session, pastes this file, and that session builds exactly **one** Solution for exactly **one** queued lead, writes the result back to the queue, and stops. It does not touch MSD's code.
+1. **Phase 1 (once)**: A cto.new session builds and deploys MSD (the Worker) itself — Cloudflare, Supabase, Telegram bot, Gemini key, Reddit search wired up. Once deployed, MSD runs on its own, permanently, on Cloudflare's cron — no cto.new session is needed to keep it running.
+2. **Phase 2 (repeated, one at a time, as needed)**: MSD finds and triages leads on its own and queues Bucket-A ones (see queue below). Separately, whenever there's a queued lead, Cj opens a fresh cto.new session, pastes this file, and that session builds exactly **one** Solution for exactly **one** queued lead, writes the result back to the queue, and stops. It does not touch MSD's code.
 
 ## Stage 1 — Search (defined subreddit list — Reddit's API approval process requires this, not sitewide)
 Use Reddit's search API scoped to the approved subreddit list from the app's API registration (starting set: r/smallbusiness, r/Entrepreneur, r/forhire, r/slavelabour, r/webdev, r/SaaS, r/startups, r/freelance). This isn't a self-imposed limit — Reddit's app-approval form requires declaring the target subreddits, so search must stay within whatever was declared there. Expanding later means updating the registration, not just widening the query.
@@ -40,25 +40,26 @@ For each post + its comment replies, extract:
   3. Context/tone/implication-derived signals (word choice, replies to their own comments, repeated frustration).
   Weight accordingly. Note explicitly: a reply like "$3,000 sounds more reasonable" is *not* proof of an actual budget or readiness to pay — flag it as inferred, not confirmed.
 
-## Stage 3 — Feasibility triage (highest-uncertainty step — be conservative)
+## Stage 3 — Feasibility triage + stated-budget gate (highest-uncertainty step — be conservative)
 Classify each extracted DS need into exactly one bucket:
-- **A — Buildable now**: achievable in a single focused PxC session as a working, demoable, time/use-limited product (web app, script, automation/workflow, browser extension, chatbot, admin portal, small game, even a full small site — no size limit as long as one session can finish it). These get written to the **Leads needing Solutions** queue below.
-- **B — Buildable, but needs Cj's high-end PC / paid cloud compute**. Logged separately, reported to Cj, not queued for PxC — he'll action these once compute is available.
+- **A — Buildable now AND has stated purchase signal**: achievable in a single focused cto.new session as a working, demoable, time/use-limited product (web app, script, automation/workflow, browser extension, chatbot, admin portal, small game, even a full small site — no size limit as long as one session can finish it) **AND the post/comments contain a stated budget, a competing quote, or explicit "hire now" language**. Only these get written to the **Leads needing Solutions** queue below. This gate exists because build cost is paid on every lead but revenue only on conversions — speculatively building for every plausible lead loses money on the non-converters.
+- **Watch — Buildable but no stated budget**: same as A technically, but the author hasn't stated they're ready to pay. Logged separately. Do not build.
+- **B — Buildable, but needs Cj's high-end PC / paid cloud compute**. Logged separately, reported to Cj, not queued — he'll action these once compute is available.
 - **C — Not buildable in this model at all** (regulated/certified software, physical/on-site service, needs enterprise data access, etc.). Discard.
 Be conservative — a false "yes, buildable" call is worse than passing on a lead.
 
 **Priority score, for every Bucket A lead (this is a rough pass, not final pricing)**: combine the Stage 2 urgency/desperation score with a rough estimated offer value using the same Marie's Rule underbid logic from Stage 5 (lowest visible/inferable number, positioned below it) — but skip the $20/hr floor check here, since no build hours exist yet. Write this as a single 1–5 priority number (5 = most urgent + highest estimated value) into the queue. This is what determines which lead a Phase 2 session should pick up next — always the highest priority `queued` row, not just whatever's oldest.
 
 ## Leads needing Solutions (queue)
-This is the handoff point between MSD and Solution-building sessions. Live data lives in Supabase (`leads` table, `bucket`/`priority`/`status`/`solution_url`/`hours` columns) — this section is a portable snapshot for a fresh PxC session to read/update directly if Supabase access isn't already wired into that session. **Always sort by Priority, highest first — that's the order Phase 2 sessions work the queue in.**
+This is the handoff point between MSD and Solution-building sessions. Live data lives in Supabase (`leads` table, `bucket`/`priority`/`status`/`solution_url`/`hours` columns) — this section is a portable snapshot for a fresh cto.new session to read/update directly if Supabase access isn't already wired into that session. **Always sort by Priority, highest first — that's the order Phase 2 sessions work the queue in.**
 
 | Priority | Lead (post link) | DS needed | Est. offer | Status | Solution link | Hours reported |
 |---|---|---|---|---|---|---|
 | [1-5, example row — delete once real data exists] | | | | queued | | |
 
-Status values: `queued` → `building` (a PxC session is on it) → `built` (link + hours recorded, ready for Stage 5's *final* pricing pass, which re-checks the $20/hr floor against real hours).
+Status values: `queued` → `building` (a cto.new session is on it) → `built` (link + hours recorded, ready for Stage 5's *final* pricing pass, which re-checks the $20/hr floor against real hours).
 
-## Solution-building sessions (separate PxC session, one lead at a time)
+## Solution-building sessions (separate cto.new session, one lead at a time)
 This is a distinct job from Phase 1 — a fresh session doing this reads this file, does the following, and stops:
 1. Pick the next `queued` lead from the table above (or Supabase directly). Mark it `building`.
 2. Build and deploy exactly one working DS. **No fixed tool or platform** — pick whatever free AI-builder actually fits this specific need. Known free options worth considering: Bolt.new (StackBlitz — full-stack, generous free token tier), v0 by Vercel (fast for landing pages/single-page tools), NxCode (full-stack from natural language, free tier includes deploy), Lovable (polished frontends, very limited free credits — pair with Supabase if data persistence is needed). None of these is mandatory; use whatever the lead actually calls for.
@@ -90,9 +91,14 @@ Every draft (priming comment, public reply, DM) goes to Telegram with inline **A
 - Redo → re-draft with feedback, re-present.
 - Approve → see Stage 8.
 
-## Stage 8 — Send (the ToS-compliant resolution — read this once, it's already solved)
+## Stage 8 — Send (primary: public comment; secondary: DM — the ToS-compliant resolution — read this once, it's already solved)
 Reddit's own policy prohibits apps from auto-sending DMs/comments without the recipient's consent, and prohibits automated bulk messaging. This isn't residue from an earlier plan — it's Reddit's current policy, and it still applies because Reddit is still the platform. The fix that keeps this "basically automated" while staying compliant and protecting the account:
-**On Approve, the system returns the DM copy as a distinct, plain, easily copyable text block in Telegram — plus a tap-to-post/tap-to-send pre-filled link underneath.** Print the copyable text block regardless: Reddit's mobile app frequently strips URL parameters from deep links, so if the pre-filled link opens blank, Cj still has the exact text to paste by hand. Cj taps or pastes, then taps Send in Reddit's own UI. A real human fires every actual post/message — which is both what Reddit's policy requires and what keeps a 0-karma account from being algorithmically flagged as bot-operated. The bot never calls a send API directly.
+
+**Primary path — public comment on their thread.** An unsolicited DM from a 0-karma account with a link is structurally identical to phishing, both to Reddit's spam filters and to the recipient. A public reply on the thread they themselves wrote is contextual, publicly verifiable, builds karma instead of risking a ban, and is visible to anyone else with the same need — one build can attract multiple buyers instead of exactly one. On Approve for the public-reply card, the system returns a tap-to-post link to that specific post's comment box, reply pre-filled.
+
+**Secondary path — DM, fallback only.** On Approve for the DM card, the system returns the DM copy as a distinct, plain, easily copyable text block in Telegram — plus a tap-to-send pre-filled link underneath. Print the copyable text block regardless: Reddit's mobile app frequently strips URL parameters from deep links, so if the pre-filled link opens blank, Cj still has the exact text to paste by hand.
+
+Either path: Cj taps or pastes, then taps Send in Reddit's own UI. A real human fires every actual post/message — which is both what Reddit's policy requires and what keeps a 0-karma account from being algorithmically flagged as bot-operated. The bot never calls a send API directly.
 
 ## Account reality — pace this deliberately
 Reddit doesn't publish exact numeric thresholds, but brand-new 0-karma accounts are heavily and automatically scrutinized, and unsolicited sales DMs to strangers is close to the exact pattern their spam detection is built to catch. **Do not front-load dozens of actions on day one.** Sequence: several genuine warm-up comments first (Stage 6, item 1) across a day or two, before the first outreach DM. Cap outbound DMs conservatively (a handful per day, not a burst) even after warm-up. Once MSD is deployed and running from Cloudflare's stable infrastructure, ongoing search/outreach isn't bouncing across rotating trial-sandbox IPs — that risk is specific to the Phase-1 build session, not ongoing operation.

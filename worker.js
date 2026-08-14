@@ -31,8 +31,8 @@
  *         -d allowed_updates='["callback_query"]'
  *     Verify with getWebhookInfo (pending_update_count 0, no last_error_message).
  *
- * SUPABASE SETUP: run supabase-schema.sql (rev 2) in the Supabase SQL editor first.
- * It is idempotent — safe to re-run on an existing rev-1 table.
+ * SUPABASE SETUP: run supabase-schema.sql (rev 3) in the Supabase SQL editor first.
+ * It is idempotent — safe to re-run on an existing rev-1/rev-2 table.
  */
 
 const SUBREDDITS = [
@@ -124,6 +124,12 @@ async function runIngest(env) {
         // tap-to-send DM compose link. "[deleted]"/missing -> null (manual fallback).
         const author = post.author && post.author !== "[deleted]" ? post.author : null;
 
+        // spec v3 (Stage 3 stated-budget gate): only bucket A rows are QUEUED —
+        // buildable AND a stated purchase signal (stated budget / competing quote /
+        // "hire now" language). W (buildable, no stated budget) and B (needs Cj's
+        // PC/paid compute) are LOGGED with status 'deferred' — never queued, never
+        // built. C was discarded above. priority is null for W/B (schema check is
+        // 1-5; priority is only meaningful for A).
         // B8: on_conflict=post_id + resolution=ignore-duplicates makes this insert
         // tolerate a duplicate-key race (e.g. a transient dedupe-GET miss, or two
         // overlapping ticks) instead of erroring — no duplicate rows, no re-analysis
@@ -164,18 +170,20 @@ Return ONLY raw JSON, no markdown fences, matching this exact shape:
 {
   "ds_needed": "one sentence describing the Delivered Solution that would meet this need",
   "urgency_evidence": "plainly_stated_with_number | plainly_stated_no_number | inferred_only | none",
-  "bucket": "A | B | C",
+  "bucket": "A | W | B | C",
   "priority": 1-5,
   "rough_offer_estimate": number
 }
 
 Rules:
-- bucket A = buildable by a non-coder + AI in a single focused session (web app, script, automation, chatbot, small site, admin portal, etc.)
+- bucket A = buildable by a non-coder + AI in a single focused session (web app, script, automation, chatbot, small site, admin portal, etc.) AND the post/comments contain a STATED purchase signal: a stated budget, a competing quote, or explicit "hire now" language. ONLY A gets built.
+- bucket W = buildable exactly like A, but NO stated purchase signal (no stated budget, no competing quote, no hire-now language) — log only, never build, never queue.
 - bucket B = buildable but needs high-end local PC / paid heavy compute
 - bucket C = not buildable this way at all (physical service, regulated software, etc.) — discard
+- Be conservative: a false "buildable" call is worse than passing on a lead.
 - rough_offer_estimate: find the lowest stated/implied budget or competing price in the post; if none, estimate typical freelance market rate for this specific task, then position below it. This is a rough pre-build estimate only.
-- priority 1-5: combine urgency_evidence weight (stated-with-number > stated-no-number > inferred > none) with rough_offer_estimate value. 5 = most urgent + highest value.
-- Treat inferred statements like "$X sounds reasonable" as urgency_evidence: inferred_only, not plainly_stated.
+- priority 1-5: combine urgency_evidence weight (stated-with-number > stated-no-number > inferred > none) with rough_offer_estimate value. 5 = most urgent + highest value. Priority is only meaningful for A; for W/B/C set 0.
+- Treat inferred statements like "$X sounds reasonable" as urgency_evidence: inferred_only, not plainly_stated — and NOT a purchase signal, so they never qualify a lead for bucket A.
 - If bucket is C, priority and rough_offer_estimate can be 0.`;
 
   const result = await callGemini(env, prompt);
@@ -190,10 +198,13 @@ Rules:
 
 // B10 (audit §i item 8): validate + normalize the model's analysis before anything
 // is inserted. A lowercase "a" or a garbage bucket/priority must never land in the DB.
+// spec v3: buckets are A (buildable + stated purchase signal -> queued), W (buildable
+// but no stated budget -> logged, never built), B (needs Cj's PC/paid compute -> logged),
+// C (discarded). Priority is only meaningful for A.
 function normalizeAnalysis(a) {
   if (!a || typeof a !== "object") return null;
   const bucket = String(a.bucket || "").trim().toUpperCase();
-  if (!["A", "B", "C"].includes(bucket)) return null;
+  if (!["A", "W", "B", "C"].includes(bucket)) return null;
 
   const priority = Math.round(Number(a.priority));
   const estimate = (a.rough_offer_estimate === undefined || a.rough_offer_estimate === null)
@@ -204,14 +215,27 @@ function normalizeAnalysis(a) {
     return { ds_needed: a.ds_needed ? String(a.ds_needed).trim() : null, bucket, priority, rough_offer_estimate: estimate };
   }
 
-  // A/B rows go to the DB: priority must be 1-5 and ds_needed must be present
-  if (!Number.isFinite(priority) || priority < 1 || priority > 5) return null;
+  // A/W/B rows go to the DB (A queued, W/B deferred-logged): ds_needed must be present.
   if (!a.ds_needed || !String(a.ds_needed).trim()) return null;
+  const ds_needed = String(a.ds_needed).trim();
 
+  if (bucket === "A") {
+    // Only A is queued, so only A requires a valid 1-5 priority.
+    if (!Number.isFinite(priority) || priority < 1 || priority > 5) return null;
+    return {
+      ds_needed,
+      bucket,
+      priority,
+      rough_offer_estimate: Number.isFinite(estimate) && estimate >= 0 ? estimate : null
+    };
+  }
+
+  // W/B: logged only — priority is meaningless here; store null (the schema's
+  // check constraint only allows 1-5, and "0/ignored" is the spec rule for W/B/C).
   return {
-    ds_needed: String(a.ds_needed).trim(),
+    ds_needed,
     bucket,
-    priority,
+    priority: null,
     rough_offer_estimate: Number.isFinite(estimate) && estimate >= 0 ? estimate : null
   };
 }
@@ -307,7 +331,7 @@ Wording rule (Stage 5): never say "price", "fee", or "ask" — always use "offer
 }
 
 async function sendApprovalCard(env, leadId, type, text, postUrl) {
-  const label = { warmup: "Warm-up comment", reply: "Public reply", dm: "DM offer" }[type];
+  const label = { warmup: "Warm-up comment", reply: "Public reply (primary path)", dm: "DM offer (fallback path)" }[type];
   const body = `${label} (lead #${leadId})\n\n${text}`;
   const keyboard = {
     inline_keyboard: [[
@@ -381,16 +405,20 @@ async function handleTelegramWebhook(request, env) {
       return new Response("ok");
     }
     let tapLink = "";
-    if (type === "dm") {
-      // Stage 8, 2-tap send: the bot NEVER calls a Reddit send API — Cj taps this
-      // link (or copies the text) and sends it himself in Reddit's own UI.
+    if (type === "reply") {
+      // Stage 8 PRIMARY path — public comment on their thread. Tap-to-post link to
+      // this specific post's comment box (the post permalink itself). A true
+      // pre-filled reply is NOT reliably possible: Reddit's mobile app frequently
+      // strips URL parameters, so the copyable block above is the reliable path.
+      tapLink = `\n\nTap to open the thread and post this reply (public comment — PRIMARY path):\n${lead.post_url}\n\n(Reddit's mobile app frequently strips URL params, so the reply can't be pre-filled by link — tap the comment box and paste the copy above.)`;
+    } else if (type === "dm") {
+      // Stage 8 FALLBACK path — DM only. The bot NEVER calls a Reddit send API —
+      // Cj taps this link (or copies the text) and sends it himself in Reddit's own UI.
       if (lead.author) {
-        tapLink = `\n\nTap to open pre-filled (may not fill on the mobile app — text above is the fallback):\nhttps://www.reddit.com/message/compose/?to=${encodeURIComponent(lead.author)}&subject=Solution%20for%20your%20post&message=${encodeURIComponent(copy)}`;
+        tapLink = `\n\nTap to open pre-filled compose (DM — fallback path; may not fill on the mobile app — text above is the reliable copy):\nhttps://www.reddit.com/message/compose/?to=${encodeURIComponent(lead.author)}&subject=Solution%20for%20your%20post&message=${encodeURIComponent(copy)}`;
       } else {
         tapLink = `\n\nNo stored author username for this lead — open Reddit, compose a message to the post's author manually, and paste the copy above.`;
       }
-    } else if (type === "reply") {
-      tapLink = `\n\nPost this as a reply here:\n${lead.post_url}`;
     }
     await telegramSend(env, `Approved — send this yourself now:\n\n${copy}${tapLink}`, null);
   }
