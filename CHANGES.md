@@ -42,3 +42,23 @@ Date: 2026-08-14 | Engineer session | Implements the two material spec changes i
 - **handoff-v3.md** — replaced with the 2026-08-14 spec revision (already the live spec in /home/team/shared/msd).
 
 Deferred (unchanged from rev 2, TODO comments still in place): Reddit OAuth password grant for search, Stage 2 comment fetching, redo-with-feedback.
+
+---
+
+# CHANGES — multi-platform Stage 1 search (rev 4)
+
+Date: 2026-08-17 | Engineer session | Owner decision: Reddit unauthenticated search.json 403s datacenter egress IPs (verified sandbox + Cloudflare egress) and the owner CANNOT create a Reddit app (registration blocked, no OAuth). Stage 1 now fans out across keyless public APIs. Deployed + rev-4 schema applied + E2E verified live (real rows in Supabase from Hacker News).
+
+- **Stage 1 rewrite (worker.js runIngest) — three platform fetchers + one shared per-post pipeline:**
+  - `ingestHackerNews` (PRIMARY) — Algolia `search_by_date`, 7 buyer-intent queries, `tags=story`, 15 hits/query, 30-day recency filter (`numericFilters=created_at_i>...`; a stale "need a developer" post is not a lead). Normalized: `post_id = "hn_"+objectID`, `post_url = story_url || item URL`, `selftext = story_text`, `subreddit = "hackernews"`, `platform = "hackernews"`.
+  - `ingestRedditMirror` (BEST-EFFORT) — pullpush.io submission search over the same 8 subreddits in 2 paced groups (~4s apart; free tier ~10 req/min). Accepts both `{data:[...]}` (pullpush) and `{data:{children:[...]}}` (Reddit) shapes. `post_id = "rp_"+id`, `post_url = https://www.reddit.com + permalink`, `platform = "reddit"`. Cloudflare challenge pages (HTML) degrade gracefully — same B7 pattern as the old Reddit fetch.
+  - `ingestStackOverflow` (SECONDARY) — StackExchange search/advanced, 2 queries/tick × pagesize 5 (keyless budget ~300 req/day → ~192/day, leaves headroom). Errors skip silently. `post_id = "so_"+question_id`, `post_url = link`, `platform = "stackoverflow"`.
+  - `ingestPost` — the old per-subreddit loop body (dedupe GET → Gemini analysis → normalize → upsert) extracted verbatim into a shared function used by all three fetchers; only the insert now also writes `platform`. Stages 2–8 untouched (analyzeLead, normalizeAnalysis, runPostBuild, webhook, helpers all unchanged).
+  - dev.to `/api/search/feed_content` now 404s (endpoint retired) — left as `// TODO (post-deploy):` in runIngest, not implemented.
+- **Schema rev 3 → rev 4 (supabase-schema.sql)** — adds `platform text` (nullable) via idempotent `alter table public.leads add column if not exists platform text;` + included in the create-table block. NULL for any pre-rev-4 rows; no check/other changes.
+- **Post-id namespacing** — `hn_`/`rp_`/`so_` prefixes make cross-platform collisions impossible; the unique `post_id` + upsert dedupe (B8) is unchanged.
+- **Constants** — `HN_QUERIES` (7 phrases), `SO_QUERIES` (2), `PULLPUSH_GROUPS` (2×4 subs), `HN_DAYS_BACK = 30`, `PLATFORM_FETCH_DELAY_MS = 1500`, `PULLPUSH_CALL_DELAY_MS = 4000`. Per-tick Gemini cap (12) and 4s inter-call delay unchanged — the Gemini budget is shared and untouched.
+
+Deployed: worker mindmerc-deploy (version 271b9b5f-bfa8-4189-b96d-38f0b67ccf53), cron `*/15 * * * *`, GEMINI_MODEL=gemini-flash-latest unchanged. Rev-4 schema applied via Management API (HTTP 201, idempotent). E2E verified (details in DEPLOYED.md).
+
+Operational note (not a code change): gemini-flash-latest has been intermittently 503ing ("high demand") on this key since before this session (first seen in the 2026-08-14 deploy record). During a 503 window the per-tick analysis budget is consumed by failed calls and no rows insert that tick; posts are re-attempted next tick (never permanently lost). gemini-flash-lite-latest was verified working with the same key and is available as a fallback if the lead ever wants it — the deployed var was NOT changed per instruction.

@@ -1,17 +1,18 @@
 -- ============================================================
--- MINDMERC: Search & Deploy — Supabase schema (rev 3)
+-- MINDMERC: Search & Deploy — Supabase schema (rev 4)
 -- Run in Supabase SQL editor (Dashboard -> SQL -> New query) BEFORE
 -- the first Worker deploy. Idempotent: safe to re-run, and the
--- ALTERs below upgrade an existing rev-1/rev-2 table in place.
+-- ALTERs below upgrade an existing rev-1/rev-2/rev-3 table in place.
 -- ============================================================
 
 create table if not exists public.leads (
   id                    bigint generated always as identity primary key,
-  post_id               text not null unique,          -- Reddit fullname, e.g. 't3_1abc2d' (worker writes post.name)
-  post_url              text not null,                 -- https://www.reddit.com + post.permalink
+  post_id               text not null unique,          -- platform-prefixed id: 'hn_<objectID>' | 'rp_<pullpush id>' | 'so_<question_id>' | (legacy) Reddit fullname 't3_...'
+  post_url              text not null,                 -- canonical post URL on the source platform
   post_title            text not null,
-  subreddit             text not null,
-  author                text,                          -- target Reddit username (worker stores post.author; NULL if deleted/missing) — used for the Stage 8 tap-to-send compose link (DM fallback path)
+  subreddit             text not null,                 -- for Reddit: the subreddit; for non-Reddit platforms: 'hackernews' | 'stackoverflow'
+  author                text,                          -- target username (worker stores post.author; NULL if deleted/missing) — used for the Stage 8 tap-to-send compose link (DM fallback path)
+  platform              text,                          -- rev 4: source platform — 'hackernews' | 'reddit' | 'stackoverflow' (NULL for pre-rev-4 rows)
   ds_needed             text,                          -- implied Delivered Solution (Gemini)
   bucket                text not null check (bucket in ('A','W','B','C')),
   priority              smallint check (priority between 1 and 5),  -- meaningful for A only; W/B/C rows store NULL
@@ -33,6 +34,11 @@ create table if not exists public.leads (
 -- create table if not exists does NOT add columns to an existing table,
 -- so an idempotent ALTER is needed for deployments that already ran rev 1.
 alter table public.leads add column if not exists hours_missing_notified boolean not null default false;
+
+-- rev-3 -> rev-4 upgrade: source platform column (multi-platform Stage 1).
+-- Nullable on purpose — pre-rev-4 rows (if any) don't have a platform, and a
+-- nullable column is a no-op ALTER for fresh tables.
+alter table public.leads add column if not exists platform text;
 
 -- rev-2 -> rev-3 upgrade (spec v3, Stage 3 stated-budget gate): a new Watch bucket
 -- 'W' (buildable but no stated budget — logged, never queued/built). The old inline

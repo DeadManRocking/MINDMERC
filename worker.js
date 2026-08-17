@@ -31,8 +31,15 @@
  *         -d allowed_updates='["callback_query"]'
  *     Verify with getWebhookInfo (pending_update_count 0, no last_error_message).
  *
- * SUPABASE SETUP: run supabase-schema.sql (rev 3) in the Supabase SQL editor first.
- * It is idempotent — safe to re-run on an existing rev-1/rev-2 table.
+ * SUPABASE SETUP: run supabase-schema.sql (rev 4) in the Supabase SQL editor first.
+ * It is idempotent — safe to re-run on an existing rev-1/rev-2/rev-3 table.
+ *
+ * STAGE 1 (2026-08-17): multi-platform, all keyless. PRIMARY = Hacker News via
+ * Algolia; BEST-EFFORT = Reddit via pullpush.io mirror (frequently challenges
+ * datacenter IPs — degrades gracefully); SECONDARY = Stack Overflow (2 queries/tick
+ * to stay under the ~300/day keyless budget). dev.to feed_content search is retired
+ * (404) — see TODO in runIngest. Post ids are platform-prefixed (hn_/rp_/so_) so
+ * cross-platform collisions are impossible; the unique post_id dedupe is unchanged.
  */
 
 const SUBREDDITS = [
@@ -41,6 +48,39 @@ const SUBREDDITS = [
 ];
 
 const SEARCH_QUERY = "need OR help OR looking for OR urgent";
+
+// ---- Stage 1 multi-platform sources (all keyless, free tier, no new secrets) ----
+// Decision (owner, 2026-08-17): Reddit's unauthenticated search.json 403s datacenter
+// egress IPs and the owner CANNOT create a Reddit app (registration blocked — no OAuth).
+// Search now fans out across keyless public APIs; Reddit stays in via the pullpush.io
+// public mirror (best-effort — it frequently Cloudflare-challenges datacenter IPs).
+
+// PRIMARY — Hacker News via Algolia (keyless, datacenter-IP friendly).
+const HN_QUERIES = [
+  "need a developer",
+  "looking for freelancer",
+  "hire someone to build",
+  "help with my website",
+  "build an app for",
+  "budget for a developer",
+  "need help with my site"
+];
+const HN_DAYS_BACK = 30; // recency filter — a 2-year-old "need a developer" post is not a lead
+
+// SECONDARY — Stack Overflow (keyless budget ~300 req/day → 2 queries/tick × 96 ticks = 192/day, leaves headroom).
+const SO_QUERIES = [
+  "need a developer",
+  "hire someone to build"
+];
+
+// BEST-EFFORT — Reddit via pullpush.io mirror (free tier ~10 req/min → 2 grouped calls/tick).
+const PULLPUSH_GROUPS = [
+  ["smallbusiness", "Entrepreneur", "forhire", "slavelabour"],
+  ["webdev", "SaaS", "startups", "freelance"]
+];
+const PULLPUSH_CALL_DELAY_MS = 4000; // pace the 2 pullpush calls per tick
+
+const PLATFORM_FETCH_DELAY_MS = 1500; // small delay between platform fetches (shared rate-limit politeness)
 
 // B5: free-tier Gemini pacing. Never exceed ~15 RPM and never analyze more than
 // this many NEW posts per tick — a slow tick must not kill the run or burn the
@@ -64,98 +104,247 @@ export default {
 
 // ---------- STAGE 1-3: search, extract, triage, priority ----------
 
-async function runIngest(env) {
-  let geminiCallsThisTick = 0;
+// ---------- STAGE 1-3: search, extract, triage, priority ----------
 
-  for (const sub of SUBREDDITS) {
-    // One bad subreddit must not abort the rest of the tick (B7).
+// Shared per-post pipeline for every platform (Stages 1 → 3). Returns "cap" when
+// the per-tick analysis budget is exhausted (callers stop immediately, remaining
+// work is deferred to the next cron tick) — otherwise a short status string.
+async function ingestPost(env, state, post) {
+  if (state.geminiCallsThisTick >= MAX_ANALYSES_PER_TICK) {
+    console.error(`[ingest] per-tick analysis cap (${MAX_ANALYSES_PER_TICK}) reached — remaining posts deferred to next tick`);
+    return "cap";
+  }
+  const exists = await supabaseGet(env, "leads", `post_id=eq.${post.post_id}`);
+  if (exists && exists.length > 0) return "seen"; // already ingested (dedupe)
+
+  // B5: pace sequential Gemini calls (~4s) to stay under the free-tier RPM.
+  if (state.geminiCallsThisTick > 0) await sleep(GEMINI_CALL_DELAY_MS);
+  state.geminiCallsThisTick++;
+
+  const analysis = await analyzeLead(env, post);
+  if (!analysis) return "no-analysis";
+  if (analysis.bucket === "C") return "discarded-c"; // discard per Stage 3
+
+  // B1: capture the post author now — needed later for the Stage 8
+  // tap-to-send DM compose link. "[deleted]"/missing -> null (manual fallback).
+  const author = post.author && post.author !== "[deleted]" ? post.author : null;
+
+  // spec v3 (Stage 3 stated-budget gate): only bucket A rows are QUEUED —
+  // buildable AND a stated purchase signal (stated budget / competing quote /
+  // "hire now" language). W (buildable, no stated budget) and B (needs Cj's
+  // PC/paid compute) are LOGGED with status 'deferred' — never queued, never
+  // built. C was discarded above. priority is null for W/B (schema check is
+  // 1-5; priority is only meaningful for A).
+  // B8: on_conflict=post_id + resolution=ignore-duplicates makes this insert
+  // tolerate a duplicate-key race (e.g. a transient dedupe-GET miss, or two
+  // overlapping ticks) instead of erroring — no duplicate rows, no re-analysis
+  // of an already-inserted post.
+  await supabaseInsert(env, "leads", {
+    post_id: post.post_id,
+    post_url: post.post_url,
+    post_title: post.post_title || "(untitled)",
+    subreddit: post.subreddit,
+    author,
+    platform: post.platform, // rev 4: source platform (hackernews | reddit | stackoverflow)
+    ds_needed: analysis.ds_needed,
+    bucket: analysis.bucket,
+    priority: analysis.priority,
+    rough_offer_estimate: analysis.rough_offer_estimate,
+    status: analysis.bucket === "A" ? "queued" : "deferred",
+    drafted: false
+  }, { onConflict: "post_id" });
+  return "inserted";
+}
+
+async function runIngest(env) {
+  const state = { geminiCallsThisTick: 0 };
+
+  // 1. Hacker News via Algolia (PRIMARY — keyless, works from datacenter egress).
+  await ingestHackerNews(env, state);
+  await sleep(PLATFORM_FETCH_DELAY_MS);
+
+  // 2. Reddit via pullpush.io mirror (BEST-EFFORT — see module header).
+  await ingestRedditMirror(env, state);
+  await sleep(PLATFORM_FETCH_DELAY_MS);
+
+  // 3. Stack Overflow (SECONDARY — keyless budget is ~300 req/day, keep it low-volume).
+  await ingestStackOverflow(env, state);
+
+  // dev.to: /api/search/feed_content now 404s (endpoint retired by dev.to).
+  // TODO (post-deploy): re-test https://dev.to/api/search/feed_content?q=...
+  // if it ever returns again; leave OUT until then — not worth a broken fetch every tick.
+}
+
+// PRIMARY — Hacker News via Algolia search_by_date (newest first, 30-day window).
+async function ingestHackerNews(env, state) {
+  const since = Math.floor(Date.now() / 1000) - HN_DAYS_BACK * 86400;
+  for (const q of HN_QUERIES) {
+    if (state.geminiCallsThisTick >= MAX_ANALYSES_PER_TICK) return; // budget spent — defer rest to next tick
     try {
-      const url = `https://www.reddit.com/r/${sub}/search.json?q=${encodeURIComponent(SEARCH_QUERY)}&restrict_sr=1&sort=new&limit=15`;
-      // TODO (post-deploy): switch to Reddit OAuth password grant (spec
-      // requirement; needs REDDIT_CLIENT_ID/REDDIT_CLIENT_SECRET/REDDIT_USERNAME/
-      // REDDIT_PASSWORD env vars) — reduces 429/HTML-block risk from shared egress IPs.
+      const url = `https://hn.algolia.com/api/v1/search_by_date?query=${encodeURIComponent(q)}&tags=story&hitsPerPage=15&numericFilters=created_at_i%3E${since}`;
       let res;
       try {
-        res = await fetch(url, {
-          headers: { "User-Agent": "MINDMERC-SearchDeploy/1.0 (by /u/MINDMERC)" }
-        });
+        res = await fetch(url, { headers: { "User-Agent": "MINDMERC-SearchDeploy/1.0" } });
       } catch (e) {
-        console.error(`[ingest] r/${sub} fetch failed:`, e && e.message);
-        continue; // network hiccup, try next subreddit, next cron tick will retry
-      }
-      if (!res.ok) {
-        console.error(`[ingest] r/${sub} HTTP ${res.status} — skipping, retry next tick`);
+        console.error(`[ingest] HN "${q}" fetch failed:`, e && e.message);
+        await sleep(PLATFORM_FETCH_DELAY_MS);
         continue;
       }
-
-      // B7: Reddit can return 200 with an HTML block page (datacenter/shared IPs).
-      // Guard res.json() so one bad subreddit can't kill the whole tick.
+      if (!res.ok) {
+        console.error(`[ingest] HN "${q}" HTTP ${res.status} — skipping, retry next tick`);
+        await sleep(PLATFORM_FETCH_DELAY_MS);
+        continue;
+      }
+      // B7 pattern: guard res.json() — a non-JSON body must not kill the tick.
       let data;
       try {
         data = await res.json();
       } catch (e) {
-        console.error(`[ingest] r/${sub} returned non-JSON body (blocked/rate-limited?) — skipping`);
+        console.error(`[ingest] HN "${q}" non-JSON body (blocked/rate-limited?) — skipping`);
+        await sleep(PLATFORM_FETCH_DELAY_MS);
         continue;
       }
-      const posts = data?.data?.children || [];
-
-      for (const p of posts) {
-        const post = p && p.data;
-        if (!post || !post.name) continue;
-
-        if (geminiCallsThisTick >= MAX_ANALYSES_PER_TICK) {
-          console.error(`[ingest] per-tick analysis cap (${MAX_ANALYSES_PER_TICK}) reached — remaining posts deferred to next tick`);
-          return;
-        }
-
-        const postId = post.name; // e.g. "t3_abc123"
-        const exists = await supabaseGet(env, "leads", `post_id=eq.${postId}`);
-        if (exists && exists.length > 0) continue; // already seen
-
-        // B5: pace sequential Gemini calls (~4s) to stay under the free-tier RPM.
-        if (geminiCallsThisTick > 0) await sleep(GEMINI_CALL_DELAY_MS);
-        geminiCallsThisTick++;
-
-        const analysis = await analyzeLead(env, post);
-        if (!analysis) continue;
-        if (analysis.bucket === "C") continue; // discard per Stage 3
-
-        // B1: capture the post author now — needed later for the Stage 8
-        // tap-to-send DM compose link. "[deleted]"/missing -> null (manual fallback).
-        const author = post.author && post.author !== "[deleted]" ? post.author : null;
-
-        // spec v3 (Stage 3 stated-budget gate): only bucket A rows are QUEUED —
-        // buildable AND a stated purchase signal (stated budget / competing quote /
-        // "hire now" language). W (buildable, no stated budget) and B (needs Cj's
-        // PC/paid compute) are LOGGED with status 'deferred' — never queued, never
-        // built. C was discarded above. priority is null for W/B (schema check is
-        // 1-5; priority is only meaningful for A).
-        // B8: on_conflict=post_id + resolution=ignore-duplicates makes this insert
-        // tolerate a duplicate-key race (e.g. a transient dedupe-GET miss, or two
-        // overlapping ticks) instead of erroring — no duplicate rows, no re-analysis
-        // of an already-inserted post.
-        await supabaseInsert(env, "leads", {
-          post_id: postId,
-          post_url: post.permalink
-            ? `https://www.reddit.com${post.permalink}`
-            : `https://www.reddit.com/r/${sub}/comments/${postId.slice(3)}`,
-          post_title: post.title || "(untitled)",
-          subreddit: sub,
-          author,
-          ds_needed: analysis.ds_needed,
-          bucket: analysis.bucket,
-          priority: analysis.priority,
-          rough_offer_estimate: analysis.rough_offer_estimate,
-          status: analysis.bucket === "A" ? "queued" : "deferred",
-          drafted: false
-        }, { onConflict: "post_id" });
+      const hits = data?.hits || [];
+      for (const hit of hits) {
+        if (state.geminiCallsThisTick >= MAX_ANALYSES_PER_TICK) return;
+        if (!hit || !hit.objectID) continue;
+        const r = await ingestPost(env, state, {
+          post_id: "hn_" + String(hit.objectID),
+          post_url: hit.story_url || `https://news.ycombinator.com/item?id=${hit.objectID}`,
+          post_title: hit.title || "(untitled)",
+          selftext: hit.story_text || "",
+          author: hit.author || null,
+          subreddit: "hackernews",
+          platform: "hackernews",
+          created_utc: hit.created_at_i || null
+        });
+        if (r === "cap") return;
       }
     } catch (e) {
-      console.error(`[ingest] r/${sub} failed:`, e && e.message);
-      continue;
+      console.error(`[ingest] HN "${q}" failed:`, e && e.message);
     }
+    await sleep(PLATFORM_FETCH_DELAY_MS);
   }
 }
+
+// BEST-EFFORT — Reddit via the pullpush.io public mirror. Frequently Cloudflare-
+// challenges datacenter IPs (HTML block page, same B7 failure shape as Reddit
+// itself) — degrade gracefully, never crash the tick. 2 grouped calls/tick,
+// paced ~4s apart to respect the ~10 req/min free tier.
+async function ingestRedditMirror(env, state) {
+  for (const group of PULLPUSH_GROUPS) {
+    if (state.geminiCallsThisTick >= MAX_ANALYSES_PER_TICK) return;
+    const subs = group.join(",");
+    try {
+      const url = `https://api.pullpush.io/reddit/search/submission/?subreddit=${subs}&q=${encodeURIComponent(SEARCH_QUERY)}&size=15&sort=desc&sort_type=created_utc`;
+      let res;
+      try {
+        res = await fetch(url, { headers: { "User-Agent": "MINDMERC-SearchDeploy/1.0" } });
+      } catch (e) {
+        console.error(`[ingest] pullpush (${subs}) fetch failed:`, e && e.message);
+        await sleep(PULLPUSH_CALL_DELAY_MS);
+        continue;
+      }
+      if (!res.ok) {
+        console.error(`[ingest] pullpush (${subs}) HTTP ${res.status} — skipping, retry next tick`);
+        await sleep(PULLPUSH_CALL_DELAY_MS);
+        continue;
+      }
+      let data;
+      try {
+        data = await res.json();
+      } catch (e) {
+        console.error(`[ingest] pullpush (${subs}) non-JSON body (Cloudflare challenge/block page?) — skipping`);
+        await sleep(PULLPUSH_CALL_DELAY_MS);
+        continue;
+      }
+      // pullpush returns {data: [ {...}, ... ]} (flat array) — unlike Reddit's
+      // {data: {children: [...]}}. Accept both shapes defensively.
+      let posts = data?.data || [];
+      if (posts && posts.children && Array.isArray(posts.children)) {
+        posts = posts.children.map((c) => c && c.data).filter(Boolean);
+      }
+      for (const post of posts) {
+        if (state.geminiCallsThisTick >= MAX_ANALYSES_PER_TICK) return;
+        if (!post || !post.id) continue;
+        const sub = post.subreddit || "unknown";
+        const r = await ingestPost(env, state, {
+          post_id: "rp_" + String(post.id),
+          post_url: post.permalink
+            ? `https://www.reddit.com${post.permalink}`
+            : `https://www.reddit.com/r/${sub}/comments/${post.id}`,
+          post_title: post.title || "(untitled)",
+          selftext: post.selftext || "",
+          author: post.author || null,
+          subreddit: sub,
+          platform: "reddit",
+          created_utc: post.created_utc || null
+        });
+        if (r === "cap") return;
+      }
+    } catch (e) {
+      console.error(`[ingest] pullpush (${subs}) failed:`, e && e.message);
+    }
+    await sleep(PULLPUSH_CALL_DELAY_MS);
+  }
+}
+
+// SECONDARY — Stack Overflow search/advanced (keyless ~300 req/day budget; 2
+// queries × 96 ticks/day = 192 req/day, pagesize 5). Errors skip silently.
+async function ingestStackOverflow(env, state) {
+  for (const q of SO_QUERIES) {
+    if (state.geminiCallsThisTick >= MAX_ANALYSES_PER_TICK) return;
+    try {
+      const url = `https://api.stackexchange.com/2.3/search/advanced?site=stackoverflow&order=desc&sort=activity&q=${encodeURIComponent(q)}&pagesize=5`;
+      let res;
+      try {
+        res = await fetch(url, { headers: { "User-Agent": "MINDMERC-SearchDeploy/1.0" } });
+      } catch (e) {
+        console.error(`[ingest] SO "${q}" fetch failed:`, e && e.message);
+        await sleep(PLATFORM_FETCH_DELAY_MS);
+        continue;
+      }
+      if (!res.ok) {
+        console.error(`[ingest] SO "${q}" HTTP ${res.status} — skipping silently`);
+        await sleep(PLATFORM_FETCH_DELAY_MS);
+        continue;
+      }
+      let data;
+      try {
+        data = await res.json();
+      } catch (e) {
+        console.error(`[ingest] SO "${q}" non-JSON — skipping`);
+        await sleep(PLATFORM_FETCH_DELAY_MS);
+        continue;
+      }
+      if (data && data.error_message) {
+        console.error(`[ingest] SO API error for "${q}": ${data.error_message} — skipping`);
+        await sleep(PLATFORM_FETCH_DELAY_MS);
+        continue;
+      }
+      const items = data?.items || [];
+      for (const it of items) {
+        if (state.geminiCallsThisTick >= MAX_ANALYSES_PER_TICK) return;
+        if (!it || !it.question_id) continue;
+        const r = await ingestPost(env, state, {
+          post_id: "so_" + String(it.question_id),
+          post_url: it.link || `https://stackoverflow.com/questions/${it.question_id}`,
+          post_title: it.title || "(untitled)",
+          selftext: "", // search/advanced doesn't return bodies; title-only triage
+          author: (it.owner && it.owner.display_name) || null,
+          subreddit: "stackoverflow",
+          platform: "stackoverflow",
+          created_utc: it.creation_date || null
+        });
+        if (r === "cap") return;
+      }
+    } catch (e) {
+      console.error(`[ingest] SO "${q}" failed:`, e && e.message);
+    }
+    await sleep(PLATFORM_FETCH_DELAY_MS);
+  }
+}
+
 
 async function analyzeLead(env, post) {
   // TODO (post-deploy): spec Stage 2 requires analyzing "each post + its comment

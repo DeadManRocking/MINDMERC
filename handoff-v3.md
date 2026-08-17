@@ -2,14 +2,13 @@
 This supersedes any earlier version of this doc. Read fully before acting. Use computer-use/browser automation to actually complete signups and clicks — don't just describe steps back.
 
 ## Live status — update this before you stop, every time
-Overwrite this block after completing any step. A fresh instance in a new session/account reads only this section to know exactly where to pick up — don't make it guess.
-- Last updated: 2026-08-12
-- Which lifecycle phase is this session: [Phase 1 — building MSD itself]
-- Reddit client ID/secret: [pending from Cj — not needed for initial deploy; OAuth wiring is a post-deploy TODO]
-- Cloudflare / Supabase / Telegram / Gemini provisioning: [Cloudflare token + account ID received; Supabase project yglhofcpdnxjkkviwmrj + service key received; Gemini key received; Telegram bot token + chat id received. Owner saving all to Secrets vault (on phone). SUPABASE_ACCESS_TOKEN pending for programmatic schema application.]
-- Worker (MSD) deployed: [no — spec-v3 update in progress, then deploy]
-- End-to-end test (search → triage → queue write): [not yet run]
-- Blockers right now: [secrets not yet all saved to vault; worker being updated to spec v3 (Stage 3 stated-budget gate + Watch bucket; Stage 8 public-comment-primary); repo PR #1 open awaiting spec update + merge]
+- Last updated: 2026-08-17 (engine session — multi-platform Stage 1, rev 4)
+- Which lifecycle phase is this session: [Phase 1 — building MSD itself; Stage 1 now multi-platform keyless]
+- Reddit client ID/secret: [NOT NEEDED / N/A — owner cannot register a Reddit app (policy-blocked, no OAuth). Reddit search now goes through the pullpush.io public mirror (best-effort).]
+- Cloudflare / Supabase / Telegram / Gemini provisioning: [DONE. Cloudflare: worker mindmerc-deploy deployed (version 271b9b5f-bfa8-4189-b96d-38f0b67ccf53) + cron */15. Supabase: project yglhofcpdnxjkkviwmrj, schema rev 4 applied + verified (platform column live). Telegram: bot webhook unchanged. Gemini: key valid, GEMINI_MODEL=gemini-flash-latest (2.5-flash/2.0-flash 404 on this key — do not change); note gemini-flash-latest 503s intermittently ("high demand") — see below.]
+- Worker (MSD) deployed: [YES — https://mindmerc-deploy.deraedtcj.workers.dev — GEMINI_MODEL=gemini-flash-latest, cron */15 * * * *, secrets persisted, webhook authenticated]
+- End-to-end test (search → triage → queue write): [PASSED for the new Stage 1. Real lead rows are in the Supabase queue from Hacker News (primary platform): 7 rows at time of writing, all bucket W -> status deferred (HN posts rarely state a budget, so the spec's Stage-3 stated-budget gate classifies them W — correct behavior; only A rows get status 'queued'). Verified from both the sandbox harness and live cron. Details: DEPLOYED.md.]
+- Blockers right now: [Gemini gemini-flash-latest 503s intermittently (Google "high demand") — during a 503 window a tick's 12-analysis budget is consumed by failed calls and no rows insert that tick; posts are retried next tick (never lost). Verified-working fallback if the owner approves: gemini-flash-lite-latest (same key, 200 OK) — deployed var left unchanged per instruction. pullpush.io Cloudflare-challenges datacenter egress (sandbox) — best-effort, degrades gracefully. Stack Overflow API works but produced no rows yet (Gemini budget spent on earlier platforms); dev.to search retired (404).]
 
 ## Victory Objective (read first, keep every decision aligned to this)
 The business model, verbatim: **Find need. Build Solution. Fill need with Solution. Reach out and offer the full-but-time-limited version (the demo) for a steal price they can't say no to, having their Solution already in hand. Collect payment. Repeat.**
@@ -28,8 +27,13 @@ Do everything, end to end, such that the person with the need cannot reasonably 
 1. **Phase 1 (once)**: A cto.new session builds and deploys MSD (the Worker) itself — Cloudflare, Supabase, Telegram bot, Gemini key, Reddit search wired up. Once deployed, MSD runs on its own, permanently, on Cloudflare's cron — no cto.new session is needed to keep it running.
 2. **Phase 2 (repeated, one at a time, as needed)**: MSD finds and triages leads on its own and queues Bucket-A ones (see queue below). Separately, whenever there's a queued lead, Cj opens a fresh cto.new session, pastes this file, and that session builds exactly **one** Solution for exactly **one** queued lead, writes the result back to the queue, and stops. It does not touch MSD's code.
 
-## Stage 1 — Search (defined subreddit list — Reddit's API approval process requires this, not sitewide)
-Use Reddit's search API scoped to the approved subreddit list from the app's API registration (starting set: r/smallbusiness, r/Entrepreneur, r/forhire, r/slavelabour, r/webdev, r/SaaS, r/startups, r/freelance). This isn't a self-imposed limit — Reddit's app-approval form requires declaring the target subreddits, so search must stay within whatever was declared there. Expanding later means updating the registration, not just widening the query.
+## Stage 1 — Search (multi-platform, all keyless — 2026-08-17 owner decision)
+Reddit's unauthenticated search.json 403s datacenter egress IPs (verified from both the build sandbox and Cloudflare egress), and the owner CANNOT create a Reddit app (registration blocked — no OAuth possible). So Stage 1 searches keyless public APIs instead, fanning out every cron tick:
+1. **Hacker News via Algolia (PRIMARY)** — `https://hn.algolia.com/api/v1/search_by_date?query=...&tags=story&hitsPerPage=15&numericFilters=created_at_i>...` with a fixed QUERIES list of buyer-intent phrases ("need a developer", "looking for freelancer", "hire someone to build", "help with my website", "build an app for", "budget for a developer", "need help with my site"). Recency-filtered to the last 30 days (a stale post is not a lead). post_id = `hn_<objectID>`; platform = `hackernews`.
+2. **Reddit via the pullpush.io public mirror (BEST-EFFORT)** — `https://api.pullpush.io/reddit/search/submission/?subreddit=smallbusiness,Entrepreneur,forhire,slavelabour,webdev,SaaS,startups,freelance&q=need OR help OR looking for OR urgent&size=15&sort=desc&sort_type=created_utc`, 2 grouped calls per tick paced ~4s apart (free tier ~10 req/min). pullpush frequently Cloudflare-challenges datacenter IPs — the worker degrades gracefully (logs and skips), same B7 pattern as the old Reddit fetch. post_id = `rp_<id>`; platform = `reddit`.
+3. **Stack Overflow (SECONDARY, low volume)** — `https://api.stackexchange.com/2.3/search/advanced?site=stackoverflow&order=desc&sort=activity&q=...&pagesize=5` with 2 queries per tick (keyless budget ~300 req/day → ~192/day used). Errors skip silently. post_id = `so_<question_id>`; platform = `stackoverflow`.
+4. **dev.to (NOT LIVE)** — `/api/search/feed_content` now 404s (endpoint retired); left as a `// TODO (post-deploy):` in runIngest.
+Post ids are platform-prefixed (`hn_`/`rp_`/`so_`), so cross-platform collisions are impossible; the unique `post_id` dedupe and the per-tick Gemini cap (12 analyses) are unchanged. Nothing here needs a credential or a machine on the owner's side — it all runs from the Worker's cron.
 
 ## Stage 2 — Need + urgency extraction
 For each post + its comment replies, extract:
